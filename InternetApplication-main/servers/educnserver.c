@@ -1,0 +1,412 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <time.h>
+#define PORT 53
+#define CLIENT_IP "127.0.0.1"
+#define LOCAL_SERVER_IP "127.0.0.2"
+#define ROOT_SERVER_IP "127.0.0.3"
+#define AMOUNT 1500
+#define BufferSize 512
+#define TYPE_A        0X0001
+#define TYPE_CNMAE    0X0005
+#define TYPE_MX       0x000f
+#define BACKLOG 10
+
+struct DNS_Header{
+    unsigned short id;
+    unsigned short flags;
+    unsigned short questions;  
+    unsigned short answers;  
+    unsigned short authority;
+    unsigned short additional;
+};
+
+struct TCP_Header{
+    unsigned short length;
+    unsigned short id;
+    unsigned short flags;
+    unsigned short questions;  
+    unsigned short answers;  
+    unsigned short authority;
+    unsigned short additional;
+};
+
+struct DNS_Query{
+    int length;
+    unsigned short qtype;
+    unsigned short qclass;
+    unsigned char name[512];
+};
+
+struct DNS_RR{
+    int length;
+    unsigned char name[512];
+    unsigned short type;
+    unsigned short class;
+    unsigned int ttl;
+    unsigned short data_len;
+    unsigned short pre;
+    unsigned char rdata[512];
+};
+
+struct Translate{
+    char domain[512];
+    unsigned short qtype;
+};
+
+int DNS_Create_Header(struct DNS_Header *header){
+    if(header == NULL)
+        return -1;
+    memset(header, 0x00, sizeof(struct DNS_Header));
+    srandom(time(NULL));
+    header -> id = random();
+    header -> flags = htons(0x0100);
+    header -> questions = htons(0x01);
+    header -> answers = htons(0);
+    header -> authority = htons(0x01);
+    header -> additional = htons(0);
+    return 0;
+}
+
+int TCP_Create_Header(struct TCP_Header *header){
+    if(header == NULL)
+        return -1;
+    memset(header, 0x00, sizeof(struct DNS_Header));
+    srandom(time(NULL));
+    header -> length = htons(0);
+    header -> id = random();
+    header -> flags = htons(0x0100);
+    header -> questions = htons(0x01);
+    header -> answers = htons(0);
+    header -> authority = htons(0);
+    header -> additional = htons(0);
+    return 0;
+}
+
+
+int DNS_Create_Query(struct DNS_Query *query, const char *type, const char *hostname){
+    if(query == NULL || hostname == NULL)
+        return -1;
+    memset(query, 0x00, sizeof(struct DNS_Query));
+    memset(query->name,0x00,512);
+    if(query -> name ==NULL){
+        return -2;
+    }
+
+    query -> length = strlen(hostname) + 1;
+    unsigned short qtype;
+    if(strcmp(type,"A") == 0)query -> qtype = htons(TYPE_A);
+    if(strcmp(type,"MX") == 0)query -> qtype = htons(TYPE_MX);
+    if(strcmp(type,"CNAME") == 0)query -> qtype = htons(TYPE_CNMAE);
+    query -> qclass = htons(0x0001);
+    const char apart[2] = ".";
+    char *qname = query -> name;
+    char *hostname_dup = strdup(hostname);
+    char *token = strtok(hostname_dup, apart);
+
+    while(token != NULL){
+        size_t len = strlen(token);
+        *qname = len;
+        qname++;
+        strncpy(qname, token, len +1);
+        qname += len;
+        token = strtok(NULL, apart);
+    } 
+
+    free(hostname_dup);
+    return 0;
+}
+
+int DNS_Create_RR(struct DNS_RR *rr, const char *domain, int ttl,
+unsigned short class, unsigned short type,const char *rdata){
+    memset(rr, 0x00, sizeof(struct DNS_RR));
+    memset(rr -> name, 0x00, 512);
+    if(rr -> name == NULL){
+        return -2;
+    }
+    rr -> length = strlen(domain) + 1;
+    rr -> class = htons(class);
+    rr -> type = htons(type);
+    rr -> ttl = htonl(ttl);
+
+    const char apart[2] = ".";
+    char *nameptr = rr -> name;
+    char *domain_dup = strdup(domain);
+    char *apartDomain = strtok(domain_dup, apart); 
+    while(apartDomain != NULL){
+        size_t len = strlen(apartDomain);
+        *nameptr = len;
+        nameptr++;
+        strncpy(nameptr, apartDomain, len + 1);
+        nameptr += len;
+        apartDomain = strtok(NULL, apart);
+    }
+
+    if(type == 0x000f){
+        rr -> pre = htons(0x0005);
+        char *rdataptr = rr -> rdata;
+        char *rdata_dup = strdup(rdata);
+        char *apartRdata = strtok(rdata_dup, apart); 
+        while(apartRdata != NULL){
+        size_t len = strlen(apartRdata);
+        *rdataptr = len;
+        rdataptr++;
+        strncpy(rdataptr, apartRdata, len + 1);
+        rdataptr += len;
+        apartRdata = strtok(NULL, apart);
+        int data_len = strlen(rdata) + 4;
+        rr -> data_len = htons(data_len);
+        }
+    }
+
+    if(type == 0x0005){
+        char *rdataptr = rr -> rdata;
+        char *rdata_dup = strdup(rdata);
+        char *apartRdata = strtok(rdata_dup, apart); 
+        while(apartRdata != NULL){
+        size_t len = strlen(apartRdata);
+        *rdataptr = len;
+        rdataptr++;
+        strncpy(rdataptr, apartRdata, len + 1);
+        rdataptr += len;
+        apartRdata = strtok(NULL, apart);
+        int data_len = strlen(rdata) + 2;
+        rr -> data_len = htons(data_len);
+        }
+    }
+
+    if(type == 0x0001){
+        char *rdataptr = rr -> rdata;
+        char *rdata_dup = strdup(rdata);
+        char *apartRdata = strtok(rdata_dup, apart); 
+        while(apartRdata != NULL){
+        int num = atoi(apartRdata);
+        char *hex = (char *)malloc(sizeof(char) *9);
+        sprintf(hex, "%02x", num);
+        strncpy(rdataptr, hex, 2);
+        rdataptr += 2;
+        apartRdata = strtok(NULL, apart);
+        }
+        uint32_t host_num = strtoul(rr -> rdata, NULL, 16);
+        uint32_t net_num = htonl(host_num);
+        memcpy(rr -> rdata, &net_num, sizeof(net_num));
+        int datalen = strlen(rr -> rdata);
+        rr -> data_len = htons(4);
+        int lenlen = sizeof(rr -> data_len);
+    }
+   
+    return 0;
+}
+
+
+int DNS_Create_Response(struct TCP_Header *header, struct DNS_Query *query, struct DNS_RR *rr, char *response, int rlen){
+    if(header == NULL || query == NULL || response == NULL) return -1;
+    memset(response, 0, rlen);
+    memcpy(response, header, sizeof(struct TCP_Header));
+    int offset = sizeof(struct TCP_Header);
+    memcpy(response + offset, query -> name, query -> length + 1);
+    offset += query -> length + 1;
+    memcpy(response + offset, &query -> qtype, sizeof(query -> qtype));
+    offset += sizeof(query -> qtype);
+    memcpy(response + offset, &query -> qclass, sizeof(query -> qclass));
+    offset += sizeof(query -> qclass);
+    memcpy(response + offset, rr -> name, rr -> length + 1);
+    offset += rr -> length + 1;
+    memcpy(response + offset, &rr -> type, sizeof(rr -> type));
+    offset += sizeof(rr -> type);
+    memcpy(response + offset, &rr -> class, sizeof(rr -> class));
+    offset += sizeof(rr -> class);
+    memcpy(response + offset, &rr -> ttl, sizeof(rr -> ttl));
+    offset += sizeof(rr -> ttl);
+    memcpy(response + offset, &rr -> data_len, sizeof(rr -> data_len));
+    offset += sizeof(rr -> data_len);
+    if(rr -> type == htons(0x000f)){
+        memcpy(response + offset, &rr -> pre, sizeof(rr -> pre));
+        offset += sizeof(rr -> pre);
+    }
+    memcpy(response + offset, rr -> rdata, strlen(rr -> rdata));
+    offset += sizeof(rr -> rdata);
+    return offset;
+}
+
+static void DNS_Parse_Name(unsigned char *spoint, char *out, int *len){
+    int flag = 0, n = 0, alen = 0;
+    char *pos = out + (*len);
+
+    while(1){
+        flag = (int)spoint[0];
+        if(flag == 0){
+            break;
+        }
+        else{
+            spoint++;
+            memcpy(pos, spoint, flag);
+            pos += flag;
+            spoint += flag;
+
+            *len += flag;
+            if((int)spoint[0] != 0){
+                memcpy(pos, ".", 1);
+                pos += 1;
+                (*len) += 1;
+            }
+        }
+    }
+}
+
+int cacheSearch(char *path, char *out, struct Translate *request){
+    int i = 0, j = 0;
+    int num = 0;
+    char *temp[AMOUNT];
+    char *type;
+
+    if(request -> qtype == htons(TYPE_A)) {type = "A";}
+    if(request -> qtype == htons(TYPE_MX)) {type = "MX";}
+    if(request -> qtype == htons(TYPE_CNMAE)) {type = "CNAME";}
+
+    FILE *fp = fopen(path, "ab+");
+    if(!fp){
+        printf("Open file failed\n");
+        exit(-1);
+    }
+    char *reac;
+
+    while(i < AMOUNT - 1){
+        temp[i] = (char *)malloc(sizeof(char)*200);
+        if(fgets(temp[i], AMOUNT, fp) == NULL) break;
+        else{
+        reac = strchr(temp[i], '\n');
+        if(reac) *reac = '\0';
+        }
+        i++;
+    } 
+    if(i == AMOUNT - 1) printf("The DNS record memory is full.\n");
+
+    while(j < i){
+        char *cacheDomain = strtok(temp[j], " ");
+        char *cacheTTL = strtok(NULL, " ");
+        char *cacheClass = strtok(NULL, " ");
+        char *cacheType = strtok(NULL, " ");
+        char *cacheRdata = strtok(NULL, " ");
+        unsigned short tempClass;
+        unsigned short tempType;
+        if(strcmp(cacheClass, "IN") == 0){tempClass = 0x0001;}
+        if(strcmp(cacheType, "A") == 0){tempType = 0x0001;}
+        if(strcmp(cacheType, "MX") == 0){tempType = 0x000f;}
+        if(strcmp(cacheType, "CNAME") == 0){tempType = 0x0005;}
+        
+        if(strcmp(cacheDomain, request -> domain) == 0 && tempType == request -> qtype){
+            struct TCP_Header header = {0};
+            TCP_Create_Header(&header);
+            header.flags = htons(0x8000);
+            header.authority = htons(0);
+            header.answers = htons(0x0001);
+            char *rtype;
+            if(request -> qtype == 0x01){rtype = "A";}
+            if(request -> qtype == 0x05){rtype = "CNAME";}
+            if(request -> qtype == 0x0f){rtype = "MX";}
+            struct DNS_Query query = {0};
+            DNS_Create_Query(&query, cacheType, request -> domain);
+            struct DNS_RR rr = {0};
+            DNS_Create_RR(&rr, cacheDomain, atoi(cacheTTL), tempClass, tempType, cacheRdata);
+            int tcplen = 18 + strlen(request -> domain) + 2 + strlen(cacheDomain) + 2 + strlen(cacheRdata) + 2 + 10; 
+            header.length = htons(tcplen);
+            if(request -> qtype == 0x0f){tcplen += 2;}
+            int rlen = DNS_Create_Response(&header, &query, &rr, out, 512);
+            return tcplen;
+        }
+        else{j++;}
+    }
+    printf("this is a new request\n");
+    return -1;
+}
+
+int main(){
+    int tcpsock;
+    struct sockaddr_in tld_server_addr, local_server_addr;
+    char recvBuffer[BufferSize];
+    char sendBuffer[BufferSize];
+    char *sendBufferPointer = sendBuffer;
+    int lsa_len = sizeof(local_server_addr);
+
+    bzero(&tld_server_addr, sizeof(tld_server_addr));
+    tld_server_addr.sin_family = AF_INET;
+    tld_server_addr.sin_port = htons(PORT);
+    tld_server_addr.sin_addr.s_addr = inet_addr("127.0.0.8");
+    bzero(&local_server_addr, sizeof(local_server_addr));
+    local_server_addr.sin_family = AF_INET;
+    local_server_addr.sin_port = htons(PORT);
+    local_server_addr.sin_addr.s_addr = inet_addr(LOCAL_SERVER_IP);
+
+    tcpsock = socket(AF_INET, SOCK_STREAM, 0);
+    if(tcpsock < 0){
+        perror("educn TCP socket创建出错\n");
+        exit(-1);
+    }
+
+    int on = 1;
+    if(setsockopt(tcpsock, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) < 0){
+        perror("educn TCP setsockopt出错\n ");
+        exit(-1);
+    }
+
+    if(bind(tcpsock, (struct sockaddr *)&tld_server_addr, sizeof(tld_server_addr)) < 0){
+        perror("educn TCP bind出错\n");
+        exit(-1);
+    }
+
+    if(listen(tcpsock, BACKLOG) < 0){
+        perror("educn TCP listen出错\n");
+        exit(-1);
+    }
+    printf("educn server is listening...\n");
+
+    int consock;
+    if((consock = accept(tcpsock, (struct sockaddr *)&local_server_addr, &lsa_len)) < 0){
+        perror("educn TCP accept出错\n");
+        exit(-1);
+    }
+
+    if(recv(consock, recvBuffer, sizeof(recvBuffer), 0) < 0){
+        perror("educn TCP recv 出错\n");
+        exit(-1);
+    }
+
+    unsigned char *recvBufferPointer = recvBuffer;
+    unsigned short qtype;
+    int d_len = 0;
+    int tempTTL = 86400;
+    unsigned short tempType = 0x0001;
+    unsigned short tempClass = 0x0001;
+    char *apart[20];
+
+    struct Translate request;
+    bzero(&request, sizeof(struct Translate));
+    int r_len = 0;
+    recvBufferPointer += 14;
+    DNS_Parse_Name(recvBufferPointer, request.domain, &r_len);
+    recvBufferPointer += (r_len + 2);
+    request.qtype = ntohs(*(unsigned short *)recvBufferPointer);
+    recvBufferPointer += 2;
+    r_len += 2;
+    printf("request domain : %s\n", request.domain);
+    printf("request qtype : %hd\n",request.qtype);
+
+    int tcplen = cacheSearch("//home//fisheep//servers//educn.txt", sendBufferPointer, &request);
+    if(tcplen > 0){
+        printf("cacheSerch successful!\n");
+        if(send(consock, sendBuffer, tcplen + 2, 0) < 0){
+        perror("com TCP send 出错\n");
+        exit(-1);
+        }
+    }
+
+    return 0;
+}
